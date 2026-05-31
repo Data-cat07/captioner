@@ -18,6 +18,7 @@ import websocket
 
 
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
+OPENAI_TRANSLATION_URL = "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate"
 RESPONSES_URL = "https://api.openai.com/v1/responses"
 INPUT_RATE = 48000
 OPENAI_RATE = 24000
@@ -35,15 +36,20 @@ TERM_REPLACEMENTS = {
 
 LANGUAGES = {
     "한국어만": None,
-    "English": "English",
-    "Vietnamese": "Vietnamese",
-    "Chinese": "Chinese",
-    "Japanese": "Japanese",
-    "Russian": "Russian",
-    "Thai": "Thai",
+    "English": "en",
+    "Vietnamese": "vi",
+    "Chinese": "zh",
+    "Japanese": "ja",
+    "Russian": "ru",
+    "Thai": "th",
+    "Mongolian": "mn",
+    "Uzbek": "uz",
+    "Arabic": "ar",
+}
+
+TEXT_TRANSLATION_LANGUAGES = {
     "Mongolian": "Mongolian",
     "Uzbek": "Uzbek",
-    "Arabic": "Arabic",
 }
 
 TRANSCRIPTION_MODELS = [
@@ -129,10 +135,12 @@ class RealtimeCaptioner:
         api_key: str,
         events: "queue.Queue[CaptionEvent]",
         transcription_model: str,
+        target_language: Optional[str],
     ):
         self.api_key = api_key
         self.events = events
         self.transcription_model = transcription_model
+        self.target_language = target_language
         self.stop_event = threading.Event()
         self.ws: Optional[websocket.WebSocketApp] = None
         self.ws_ready = threading.Event()
@@ -151,6 +159,8 @@ class RealtimeCaptioner:
         self.stop_event.set()
         if self.ws:
             try:
+                if self.target_language:
+                    self._send({"type": "session.close"})
                 self.ws.close()
             except Exception:
                 pass
@@ -160,8 +170,9 @@ class RealtimeCaptioner:
             f"Authorization: Bearer {self.api_key}",
             "OpenAI-Safety-Identifier: metaverse-captioner-local",
         ]
+        url = OPENAI_TRANSLATION_URL if self.target_language else OPENAI_REALTIME_URL
         self.ws = websocket.WebSocketApp(
-            OPENAI_REALTIME_URL,
+            url,
             header=headers,
             on_open=self._on_open,
             on_message=self._on_message,
@@ -171,6 +182,22 @@ class RealtimeCaptioner:
         self.ws.run_forever(ping_interval=20, ping_timeout=10)
 
     def _on_open(self, ws: websocket.WebSocketApp) -> None:
+        if self.target_language:
+            config = {
+                "type": "session.update",
+                "session": {
+                    "audio": {
+                        "output": {
+                            "language": self.target_language,
+                        }
+                    }
+                },
+            }
+            ws.send(json.dumps(config))
+            self.ws_ready.set()
+            self.events.put(CaptionEvent("status", "Translation session connecting..."))
+            return
+
         transcription = {
             "model": self.transcription_model,
             "language": "ko",
@@ -203,11 +230,18 @@ class RealtimeCaptioner:
 
         event_type = event.get("type")
         if event_type in {"session.created", "session.updated"}:
-            self.events.put(CaptionEvent("status", "Session ready. Capturing system audio..."))
+            mode = "Translation" if self.target_language else "Transcription"
+            self.events.put(CaptionEvent("status", f"{mode} session ready. Capturing system audio..."))
             if not self.audio_started:
                 self.audio_started = True
                 self.audio_thread = threading.Thread(target=self._capture_audio, daemon=True)
                 self.audio_thread.start()
+        elif event_type == "session.output_transcript.delta":
+            delta = event.get("delta", "")
+            if delta:
+                self.events.put(CaptionEvent("translation_delta", delta))
+        elif event_type == "session.closed":
+            self.stop_event.set()
         elif event_type == "conversation.item.input_audio_transcription.delta":
             self.partial_text += event.get("delta", "")
             self.events.put(CaptionEvent("partial", self.partial_text))
@@ -255,8 +289,13 @@ class RealtimeCaptioner:
                 while not self.stop_event.is_set():
                     data = recorder.record(numframes=chunk_frames)
                     audio = pcm16_base64(data)
-                    if not self._send({"type": "input_audio_buffer.append", "audio": audio}):
+                    append_type = (
+                        "session.input_audio_buffer.append" if self.target_language else "input_audio_buffer.append"
+                    )
+                    if not self._send({"type": append_type, "audio": audio}):
                         break
+                    if self.target_language:
+                        continue
                     sent_chunks += 1
                     if sent_chunks >= commit_chunks:
                         if not self._send({"type": "input_audio_buffer.commit"}):
@@ -388,15 +427,20 @@ class CaptionWindow:
             text = normalize_caption_text(event.text)
             self.final_lines.append(text)
             self.log_lines.append(f"[ko] {text}")
-            if LANGUAGES.get(self.language_var.get()):
+            text_translation_target = TEXT_TRANSLATION_LANGUAGES.get(self.language_var.get())
+            if text_translation_target:
                 self.status_var.set("Translating...")
-                self._translate_async(text)
+                self._translate_async(text, text_translation_target)
             else:
                 self._show_caption(text)
         elif event.kind == "translation":
             self.log_lines.append(f"[{self.language_var.get()}] {event.text}")
             self._show_caption(event.text)
             self.status_var.set("Captioning...")
+        elif event.kind == "translation_delta":
+            self.log_lines.append(event.text)
+            self._append_caption_chunk(event.text)
+            self.status_var.set("Translating live...")
         elif event.kind == "status":
             self.status_var.set(event.text)
         elif event.kind == "error":
@@ -442,9 +486,19 @@ class CaptionWindow:
         self.caption.see("end")
         self.caption.configure(state="disabled")
 
-    def _translate_async(self, korean_text: str) -> None:
-        target = LANGUAGES.get(self.language_var.get())
-        if not target or not self.translator:
+    def _append_caption_chunk(self, text: str) -> None:
+        if not text:
+            return
+        self.display_text = f"{self.display_text}{text}"
+        self.display_text = self.display_text[-5000:]
+        self.caption.configure(state="normal")
+        self.caption.delete("1.0", "end")
+        self.caption.insert("end", self.display_text)
+        self.caption.see("end")
+        self.caption.configure(state="disabled")
+
+    def _translate_async(self, korean_text: str, target: str) -> None:
+        if not self.translator:
             return
 
         def worker() -> None:
@@ -462,10 +516,13 @@ class CaptionWindow:
             if not self.ask_api_key():
                 messagebox.showerror("Missing API key", "API 키가 필요합니다.")
                 return
+        selected_language = self.language_var.get()
+        realtime_target = None if selected_language in TEXT_TRANSLATION_LANGUAGES else LANGUAGES.get(selected_language)
         self.captioner = RealtimeCaptioner(
             self.api_key,
             self.events,
             "gpt-realtime-whisper",
+            realtime_target,
         )
         self.captioner.start()
         self.clear_caption()
